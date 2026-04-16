@@ -6,5 +6,5 @@ use Illuminate\Database\Eloquent\Model;
 
 class ChatLog extends Model
 {
-    protected $fillable = ['user_query','response','source'];
+    protected $fillable = ['user_query', 'response', 'source'];
 }

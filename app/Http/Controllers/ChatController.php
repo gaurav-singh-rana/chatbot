@@ -1,233 +1,202 @@
 <?php
 
 namespace App\Http\Controllers;
-use Illuminate\Support\Facades\Http;
-use Illuminate\Http\Request;
-use App\Models\Faq;
+
 use App\Models\ChatLog;
-use OpenAI\Laravel\Facades\OpenAI;
+use App\Models\Faq;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 
 class ChatController extends Controller
 {
-
-public function chat(Request $request)
-{
-    $query = strtolower(trim($request->message));
-    $words = explode(' ', $query);
-
-    
-    $intent = $this->detectIntent($query);
-
-    
-    $faqs = Faq::get();
-
-    $bestMatch = null;
-    $bestScore = 0;
-
-    foreach ($faqs as $faq) {
-        $score = 0;
-
-        foreach ($words as $word) {
-            if(strlen($word) < 2) continue;
-
-            if (str_contains($faq->keywords, $word)) $score += 2;
-            if (str_contains($faq->question, $word)) $score += 1;
-        }
-
-        // Intent boost
-        if ($faq->category === $intent) {
-            $score += 3;
-        }
-
-        if ($score > $bestScore) {
-            $bestScore = $score;
-            $bestMatch = $faq;
-        }
-    }
-
-   
-    if ($bestMatch && $bestScore >= 3) {
-        $this->logChat($query, $bestMatch->answer, 'Database');
-
-        return response()->json([
-            'reply' => $bestMatch->answer
+    public function chat(Request $request)
+    {
+        $validated = $request->validate([
+            'message' => ['required', 'string', 'max:500'],
         ]);
-    }
 
-    
-    try {
-        $apiKey = config('services.gemini.key') ?? env('GEMINI_API_KEY');
-
-        $url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent?key=" . $apiKey;
-
+        $query = strtolower(trim($validated['message']));
+        $words = preg_split('/\s+/', $query, -1, PREG_SPLIT_NO_EMPTY);
         $intent = $this->detectIntent($query);
 
-        $prompt = $this->buildPrompt($query, $intent);
+        $faqs = Faq::all();
+        $bestMatch = null;
+        $bestScore = 0;
 
-        $response = Http::post($url, [
-            'contents' => [
-                [
-                    'parts' => [
-                        ['text' => $prompt]
-                    ]
-                ]
-            ],
-            'generationConfig' => [
-                'temperature' => 0.3,
-                'maxOutputTokens' => 100
-            ]
-        ]);
+        foreach ($faqs as $faq) {
+            $score = 0;
+            $faqKeywords = strtolower((string) $faq->keywords);
+            $faqQuestion = strtolower((string) $faq->question);
 
-        $data = $response->json();
+            foreach ($words as $word) {
+                if (strlen($word) < 2) {
+                    continue;
+                }
 
-        if (!empty($data['candidates'][0]['content']['parts'][0]['text'])) {
-            $reply = $data['candidates'][0]['content']['parts'][0]['text'];
-            $source = 'AI';
-        } else {
-            $reply = "Ask about plans, offers, or activation.";
-            $source = 'Fallback';
+                if (str_contains($faqKeywords, $word)) {
+                    $score += 2;
+                }
+
+                if (str_contains($faqQuestion, $word)) {
+                    $score += 1;
+                }
+            }
+
+            if ($faq->category === $intent) {
+                $score += 3;
+            }
+
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestMatch = $faq;
+            }
         }
 
-    } catch (\Exception $e) {
-        $reply = "System busy. Try again.";
-        $source = 'Error';
+        if ($bestMatch && $bestScore >= 3) {
+            $reply = $bestMatch->answer;
+            $source = 'FAQ';
+
+            $this->logChat($query, $reply, $source);
+
+            return response()->json([
+                'reply' => $reply,
+                'source' => $source,
+            ]);
+        }
+
+        try {
+            $apiKey = config('services.gemini.key') ?? env('GEMINI_API_KEY');
+            $url = 'https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent?key='.$apiKey;
+            $prompt = $this->buildPrompt($query, $intent);
+
+            $response = Http::post($url, [
+                'contents' => [
+                    [
+                        'parts' => [
+                            ['text' => $prompt],
+                        ],
+                    ],
+                ],
+                'generationConfig' => [
+                    'temperature' => 0.3,
+                    'maxOutputTokens' => 100,
+                ],
+            ]);
+
+            $data = $response->json();
+
+            if ($response->failed()) {
+                $reply = $this->extractGeminiError($data);
+                $source = 'Error';
+            } elseif (! empty($data['candidates'][0]['content']['parts'][0]['text'])) {
+                $reply = trim($data['candidates'][0]['content']['parts'][0]['text']);
+                $source = 'AI';
+            } elseif (! empty($data['promptFeedback']['blockReason'])) {
+                $reply = 'The AI response was blocked by safety filters. Please try a simpler sales-related question.';
+                $source = 'Blocked';
+            } elseif (! empty($data['candidates'][0]['finishReason'])) {
+                $reply = 'AI returned no final text for this query. Please try rephrasing the question.';
+                $source = 'Empty';
+            } else {
+                $reply = 'Please ask about plans, sales pitch, objections, or process steps.';
+                $source = 'Fallback';
+            }
+        } catch (\Exception $e) {
+            $reply = 'System is busy right now. Please try again.';
+            $source = 'Error';
+        }
+
+        $this->logChat($query, $reply, $source);
+
+        return response()->json([
+            'reply' => $reply,
+            'source' => $source,
+        ]);
     }
 
-    $this->logChat($query, $reply, $source);
+    private function detectIntent($query)
+    {
+        if (preg_match('/expensive|costly|price high|too much|mehenga/', $query)) {
+            return 'objection';
+        }
 
-    return response()->json([
-        'reply' => $reply
-        
-    ]);
-}
+        if (preg_match('/plan|price|postpaid|prepaid|wifi|fiber|ott|benefits/', $query)) {
+            return 'plan';
+        }
 
-private function detectIntent($query)
-{
-    // Objection
-    if (preg_match('/mehenga|expensive|costly|high price/', $query)) {
-        return 'objection';
+        if (preg_match('/process|activation|sim|kyc|booking|eligibility|port|steps/', $query)) {
+            return 'process';
+        }
+
+        if (preg_match('/pitch|sell|convince|how to sell|sales talk/', $query)) {
+            return 'sales';
+        }
+
+        return 'general';
     }
 
-    // Plan
-    if (preg_match('/plan|price|postpaid|prepaid|wifi|fiber|ott/', $query)) {
-        return 'plan';
-    }
-
-    // Process
-    if (preg_match('/process|activation|sim|kyc|booking|eligibility/', $query)) {
-        return 'process';
-    }
-
-    // Sales pitch
-    if (preg_match('/sell|pitch|kaise beche|convince/', $query)) {
-        return 'sales';
-    }
-
-    if (preg_match('/offer|offers|discount|deal|promo/', $query)) {
-    return 'offer';
-    }
-
-    return 'general';
-}
-
-private function buildPrompt($query, $intent)
-{
-    $base = "You are an Airtel field sales assistant.
+    private function buildPrompt($query, $intent)
+    {
+        $base = 'You are a field sales support assistant for a telecom platform.
 
 Rules:
-- Max 2 lines
-- No greetings
-- Be practical and sales-focused";
+- Maximum 2 lines
+- No greeting
+- Keep the answer simple, practical, and sales-focused';
 
-    $context = "Airtel provides prepaid, postpaid, WiFi (fiber), OTT bundles, cashback offers, SIM activation, and porting services.";
+        $context = 'The platform supports postpaid, prepaid, Wi-Fi, OTT benefits, objection handling, booking, eligibility, activation, and sales pitch guidance.';
 
-    switch ($intent) {
+        switch ($intent) {
+            case 'plan':
+                $task = 'Answer plan-related questions with benefits, value, and customer-friendly clarity.';
+                break;
+            case 'objection':
+                $task = 'Handle objections and help the sales agent justify value in simple words.';
+                break;
+            case 'process':
+                $task = 'Give short process steps for booking, eligibility, SIM, or activation queries.';
+                break;
+            case 'sales':
+                $task = 'Give a short, strong sales pitch the agent can use on ground.';
+                break;
+            default:
+                $task = 'Answer only field-sales related telecom queries in a helpful and simple way.';
+                break;
+        }
 
-        case 'plan':
-            return $base . "
-
-Context:
-$context
-
-Task:
-Explain Airtel plan benefits (OTT, data, speed, value)
-
-User: $query
-Answer:";
-
-        case 'offer':
-            return $base . "
-
-Context:
-$context
-
-Task:
-Share current Airtel offers like OTT, cashback, extra data in short
-
-User: $query
-Answer:";
-
-        case 'objection':
-            return $base . "
+        return $base."
 
 Context:
 $context
 
 Task:
-Handle objection and convince customer with value
-
-User: $query
-Answer:";
-
-        case 'process':
-            return $base . "
-
-Context:
-$context
-
-Task:
-Give step-by-step process in short
-
-User: $query
-Answer:";
-
-        case 'sales':
-            return $base . "
-
-Context:
-$context
-
-Task:
-Give a strong sales pitch to convert customer
-
-User: $query
-Answer:";
-
-        default:
-            return $base . "
-
-Context:
-$context
-
-Task:
-Understand the user query and respond in telecom context (plans, offers, services).
-If unclear, still try to give helpful Airtel-related info.
+$task
 
 User: $query
 Answer:";
     }
-}
 
-private function logChat($query, $reply, $source) {
-    try {
-        ChatLog::create([
-            'user_query' => $query,
-            'response' => $reply,
-            'source' => $source
-        ]);
-    } catch (\Exception $e) {
-        
+    private function extractGeminiError($data)
+    {
+        $message = $data['error']['message'] ?? null;
+
+        if ($message) {
+            return 'Gemini API error: '.$message;
+        }
+
+        return 'Gemini API request failed. Please check API key, quota, or model access.';
     }
-}
 
+    private function logChat($query, $reply, $source)
+    {
+        try {
+            ChatLog::create([
+                'user_query' => $query,
+                'response' => $reply,
+                'source' => $source,
+            ]);
+        } catch (\Exception $e) {
+            
+        }
+    }
 }

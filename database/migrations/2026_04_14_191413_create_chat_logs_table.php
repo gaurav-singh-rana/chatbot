@@ -12,12 +12,12 @@ return new class extends Migration
     public function up(): void
     {
         Schema::create('chat_logs', function (Blueprint $table) {
-                $table->id();
-                $table->text('user_query');
-                $table->text('response');
-                $table->string('source');
-                $table->timestamps();
-            });
+            $table->id();
+            $table->text('user_query');
+            $table->text('response');
+            $table->string('source');
+            $table->timestamps();
+        });
     }
 
     /**
